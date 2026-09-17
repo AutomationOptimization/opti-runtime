@@ -1,0 +1,757 @@
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 1463169..6a97cf3 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -153,7 +153,12 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
+         case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
+         case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
+         case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
+-        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
++        // 16 is the qcorr residual corrector's depthwise kernel width. The long-token path needs
++        // threads*(kNC-1+split_n_t)*sizeof(float) = 128*(15+32)*4 = 24064 B of shared memory,
++        // well under the 48 KB default; the short-token path only adds one more register.
++        // Verified on sm_86 / sm_89 (RTX 3090, RTX 4090, L40S) and sm_90 (H100).
++        case 16: launch_kernel(std::integral_constant<int, 16>{}); break;
++        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15, 16 right now.");
+     }
+ }
+ 
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index d06be64..4ff0561 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -365,6 +365,14 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_DFLASH_SELECTOR_TOP_K,   "%s.selector_top_k"   },
+ 
+     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
++
++    // qcorr residual corrector. These keys are NOT arch-prefixed (like the xielu.* keys below):
++    // the corrector is packed onto an already-converted GGUF by an external tool
++    // (the Opti packer), which namespaces everything it adds under "corr.".
++    { LLM_KV_CORRECTOR_HIDDEN_SIZE,      "corr.hidden_size"      },
++    { LLM_KV_CORRECTOR_CONV_KERNEL,      "corr.conv_kernel"      },
++    { LLM_KV_CORRECTOR_EMBEDDING_LENGTH, "corr.embedding_length" },
++
+     // sentence-transformers dense modules feature dims
+     { LLM_KV_DENSE_2_FEAT_IN,        "%s.dense_2_feat_in"  },
+     { LLM_KV_DENSE_2_FEAT_OUT,       "%s.dense_2_feat_out" },
+@@ -696,6 +704,16 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_DFLASH_SELECTOR_PREV,                   "selector_predecessor" },
+     { LLM_TENSOR_DFLASH_SELECTOR_NEXT,                   "selector_successor" },
+     { LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,                 "selector_hidden" },
++
++    // qcorr residual corrector. corr_norm_mu / corr_norm_sd carry no .weight/.bias suffix
++    // because they are not a norm's affine pair: they are the raw per-channel mean and
++    // standard deviation of the trained corrector's input whitening.
++    { LLM_TENSOR_CORR_NORM_MU,                           "blk.%d.corr_norm_mu" },
++    { LLM_TENSOR_CORR_NORM_SD,                           "blk.%d.corr_norm_sd" },
++    { LLM_TENSOR_CORR_CONV,                              "blk.%d.corr_conv" },
++    { LLM_TENSOR_CORR_UP,                                "blk.%d.corr_up" },
++    { LLM_TENSOR_CORR_DOWN,                              "blk.%d.corr_down" },
++    { LLM_TENSOR_CORR_GATE,                              "blk.%d.corr_gate" },
+ };
+ 
+ // declare information about the model weight tensors:
+@@ -986,6 +1004,19 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_DFLASH_SELECTOR_PREV,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_DFLASH_SELECTOR_NEXT,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
++
++    // qcorr residual corrector. The op here only drives buffer-type selection, so it must be
++    // the op the graph actually applies the tensor with:
++    //   mu  -> ggml_sub, sd -> ggml_div  (the graph computes (h - mu) / sd literally)
++    //   conv-> ggml_ssm_conv             (needs a 2-D [K, n_embd] weight, hence
++    //                                     TENSOR_ALLOW_RESHAPE at the create_tensor site)
++    //   up / down / gate -> ggml_mul_mat, with ".bias" auto-mapped to GGML_OP_ADD by the loader
++    {LLM_TENSOR_CORR_NORM_MU,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SUB}},
++    {LLM_TENSOR_CORR_NORM_SD,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_DIV}},
++    {LLM_TENSOR_CORR_CONV,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_CONV}},
++    {LLM_TENSOR_CORR_UP,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_CORR_DOWN,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_CORR_GATE,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+ };
+ 
+ LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 62dfa5d..8d0758e 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -411,6 +411,11 @@ enum llm_kv {
+ 
+     LLM_KV_SHORTCONV_L_CACHE,
+ 
++    // qcorr residual corrector; arch-independent keys, written by the Opti packer
++    LLM_KV_CORRECTOR_HIDDEN_SIZE,
++    LLM_KV_CORRECTOR_CONV_KERNEL,
++    LLM_KV_CORRECTOR_EMBEDDING_LENGTH,
++
+     LLM_KV_XIELU_ALPHA_N,
+     LLM_KV_XIELU_ALPHA_P,
+     LLM_KV_XIELU_BETA,
+@@ -703,6 +708,15 @@ enum llm_tensor {
+     LLM_TENSOR_DFLASH_SELECTOR_PREV,
+     LLM_TENSOR_DFLASH_SELECTOR_NEXT,
+     LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,
++
++    // qcorr residual corrector, one group per trunk layer. Names and dimension order are
++    // fixed by the Opti packer; see llama_model_qwen35::load_arch_tensors.
++    LLM_TENSOR_CORR_NORM_MU,
++    LLM_TENSOR_CORR_NORM_SD,
++    LLM_TENSOR_CORR_CONV,
++    LLM_TENSOR_CORR_UP,
++    LLM_TENSOR_CORR_DOWN,
++    LLM_TENSOR_CORR_GATE,
+ };
+ 
+ 
+diff --git a/src/llama-hparams.cpp b/src/llama-hparams.cpp
+index 34b3c68..d7fae13 100644
+--- a/src/llama-hparams.cpp
++++ b/src/llama-hparams.cpp
+@@ -282,6 +282,38 @@ bool llama_hparams::is_ple(uint32_t il) const {
+     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
+ }
+ 
++uint32_t llama_hparams::corr_conv_state() const {
++    if (corr_conv_k <= 1) {
++        return 0;
++    }
++
++    // the depthwise causal conv needs K-1 past columns of the normalized hidden state
++    return (corr_conv_k - 1) * n_embd;
++}
++
++uint32_t llama_hparams::corr_hidden(uint32_t il) const {
++    // the corrector only covers the trunk; MTP/NextN blocks (il >= n_layer()) never have one
++    return il < n_layer() ? corr_hidden_arr[il] : 0;
++}
++
++bool llama_hparams::has_corr(uint32_t il) const {
++    return corr_conv_k > 1 && corr_hidden(il) > 0;
++}
++
++bool llama_hparams::has_any_corr() const {
++    if (corr_conv_k <= 1) {
++        return false;
++    }
++
++    for (uint32_t il = 0; il < n_layer(); ++il) {
++        if (corr_hidden_arr[il] > 0) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
+ uint32_t llama_hparams::n_pos_per_embd() const {
+     return rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
+ }
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 3afa49e..2ec20d2 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -95,6 +95,14 @@ struct llama_hparams {
+ 
+     uint32_t n_shortconv_l_cache  = 0;
+ 
++    // qcorr residual corrector (written into the GGUF by the Opti packer).
++    // `corr.conv_kernel` is the depthwise causal kernel width K; `corr.hidden_size` is the
++    // per-layer bottleneck width H, where 0 means "this layer carries no corrector".
++    // Both keys are absent from an ordinary GGUF, which leaves K = 0 and has_corr(il) false
++    // everywhere, so the entire feature is inert on unmodified models.
++    uint32_t corr_conv_k = 0;
++    std::array<uint32_t, LLAMA_MAX_LAYERS> corr_hidden_arr;
++
+     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
+     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
+     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
+@@ -321,6 +329,16 @@ struct llama_hparams {
+     // PLE conv history rows: (kernel - 1) * ngram_size; 0 without a PLE module
+     uint32_t ple_conv_state() const;
+ 
++    // qcorr corrector conv history: (K - 1) * n_embd floats per cell; 0 without a corrector.
++    // This is deliberately NOT folded into n_embd_r(): the corrector lives on every trunk
++    // layer, including the full-attention ones that have no r_l / s_l row at all.
++    uint32_t corr_conv_state() const;
++    // the corrector bottleneck width of layer `il`, 0 if that layer has none
++    uint32_t corr_hidden(uint32_t il) const;
++    bool     has_corr(uint32_t il) const;
++    // true if ANY trunk layer carries a corrector
++    bool     has_any_corr() const;
++
+     // qwen3vl deepstack
+     // When parsed from GGUF, this implies the first N layers consume the first
+     // N deepstack embeddings. Use deepstack_mapping_arr if you need a more
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 57919ac..5a253d7 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -51,8 +51,11 @@ llama_memory_recurrent::llama_memory_recurrent(
+         auto it = ctx_map.find(buft);
+         if (it == ctx_map.end()) {
+             ggml_init_params params = {
+-                // r and s per layer, plus the separate PLE conv row where the model has one
+-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
++                // r and s per layer, plus the separate PLE conv row where the model has one,
++                // plus the separate qcorr corrector conv row where the model has one
++                /*.mem_size   =*/ size_t(((hparams.ple_conv_state()  > 0 ? 1u : 0u) +
++                                          (hparams.corr_conv_state() > 0 ? 1u : 0u) +
++                                          2u)*n_layer*ggml_tensor_overhead()),
+                 /*.mem_buffer =*/ NULL,
+                 /*.no_alloc   =*/ true,
+             };
+@@ -73,9 +76,15 @@ llama_memory_recurrent::llama_memory_recurrent(
+     r_l.resize(n_layer);
+     s_l.resize(n_layer);
+     p_l.resize(n_layer);
++    c_l.resize(n_layer);
+ 
+     for (int i = 0; i < n_layer; i++) {
+-        if (filter && !filter(i)) {
++        // the qcorr corrector runs on every trunk layer, so a layer the recurrent filter rejects
++        // may still need a c_l row. Only r_l / s_l / p_l stay behind the filter.
++        const bool in_filter = !filter || filter(i);
++        const bool want_corr = hparams.corr_conv_state() > 0 && hparams.has_corr(i);
++
++        if (!in_filter && !want_corr) {
+             LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, i);
+             continue;
+         }
+@@ -99,18 +108,27 @@ llama_memory_recurrent::llama_memory_recurrent(
+         }
+ 
+         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
+-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+-        ggml_format_name(r, "cache_r_l%d", i);
+-        ggml_format_name(s, "cache_s_l%d", i);
+-        r_l[i] = r;
+-        s_l[i] = s;
+-
+-        // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
+-        if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
+-            ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows);
+-            ggml_format_name(p, "cache_ple_r_l%d", i);
+-            p_l[i] = p;
++
++        if (in_filter) {
++            ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
++            ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
++            ggml_format_name(r, "cache_r_l%d", i);
++            ggml_format_name(s, "cache_s_l%d", i);
++            r_l[i] = r;
++            s_l[i] = s;
++
++            // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
++            if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
++                ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows);
++                ggml_format_name(p, "cache_ple_r_l%d", i);
++                p_l[i] = p;
++            }
++        }
++
++        if (want_corr) {
++            ggml_tensor * c = ggml_new_tensor_2d(ctx, type_r, hparams.corr_conv_state(), n_rows);
++            ggml_format_name(c, "cache_corr_l%d", i);
++            c_l[i] = c;
+         }
+     }
+ 
+@@ -129,12 +147,14 @@ llama_memory_recurrent::llama_memory_recurrent(
+         const size_t memory_size_r = size_r_bytes();
+         const size_t memory_size_s = size_s_bytes();
+         const size_t memory_size_p = size_p_bytes();
++        const size_t memory_size_c = size_c_bytes();
+ 
+-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
+-                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
++        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB, C (%s): %7.2f MiB\n", __func__,
++                (float)(memory_size_r + memory_size_s + memory_size_p + memory_size_c) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
+                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
+-                ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
++                ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f),
++                ggml_type_name(type_r), (float)memory_size_c / (1024.0f * 1024.0f));
+     }
+ }
+ 
+@@ -763,6 +783,18 @@ size_t llama_memory_recurrent::size_p_bytes() const {
+     return size_p_bytes;
+ }
+ 
++size_t llama_memory_recurrent::size_c_bytes() const {
++    size_t size_c_bytes = 0;
++
++    for (const auto & c : c_l) {
++        if (c != nullptr) {
++            size_c_bytes += ggml_nbytes(c);
++        }
++    }
++
++    return size_c_bytes;
++}
++
+ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+     GGML_UNUSED(flags);
+ 
+@@ -935,6 +967,24 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+         }
+     }
+ 
++    // The qcorr corrector conv history gets its OWN top-level loop: unlike the PLE row it exists
++    // on layers where r_l[il] == nullptr (the full-attention layers), so nesting it inside the
++    // R loop above would silently drop most of it.
++    for (uint32_t il = 0; il < n_layer; ++il) {
++        if (c_l[il] == nullptr) continue;
++
++        const int32_t c_type_i = (int32_t) c_l[il]->type;
++        io.write(&c_type_i, sizeof(c_type_i));
++
++        const uint64_t c_size_row = ggml_row_size(c_l[il]->type, hparams.corr_conv_state());
++        io.write(&c_size_row, sizeof(c_size_row));
++
++        for (const auto & range : cell_ranges) {
++            const size_t range_size = range.second - range.first;
++            io.write_tensor(c_l[il], range.first * c_size_row, range_size * c_size_row);
++        }
++    }
++
+     if (!s_trans) {
+         for (uint32_t il = 0; il < n_layer; ++il) {
+             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
+@@ -1147,6 +1197,31 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+         }
+     }
+ 
++    // the qcorr corrector conv history, mirroring its own top-level loop in state_write_data
++    for (uint32_t il = 0; il < n_layer; ++il) {
++        if (c_l[il] == nullptr) continue;
++
++        int32_t c_type_i_ref;
++        io.read(&c_type_i_ref, sizeof(c_type_i_ref));
++        const int32_t c_type_i = (int32_t) c_l[il]->type;
++        if (c_type_i != c_type_i_ref) {
++            LLAMA_LOG_ERROR("%s: mismatched corr type (%d != %d, layer %d)\n", __func__, c_type_i, c_type_i_ref, il);
++            return false;
++        }
++
++        uint64_t c_size_row_ref;
++        io.read(&c_size_row_ref, sizeof(c_size_row_ref));
++        const size_t c_size_row = ggml_row_size(c_l[il]->type, hparams.corr_conv_state());
++        if (c_size_row != c_size_row_ref) {
++            LLAMA_LOG_ERROR("%s: mismatched corr row size (%zu != %zu, layer %d)\n", __func__, c_size_row, (size_t) c_size_row_ref, il);
++            return false;
++        }
++
++        if (cell_count) {
++            io.read_tensor(c_l[il], head * c_size_row, cell_count * c_size_row);
++        }
++    }
++
+     if (!s_trans) {
+         for (uint32_t il = 0; il < n_layer; ++il) {
+             // skip null layers
+@@ -1303,6 +1378,10 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
+     return mem->p_l[il];
+ }
+ 
++ggml_tensor * llama_memory_recurrent_context::get_c_l(int32_t il) const {
++    return mem->c_l[il];
++}
++
+ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+     const uint32_t cell_idx = i + mem->head;
+     const int32_t  src0     = mem->cells[cell_idx].src0;
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 4abb3f5..2d39131 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -113,6 +113,10 @@ public:
+     std::vector<ggml_tensor *> s_l;
+     // a second conv history that must stay replicated across devices, so it cannot share the r row
+     std::vector<ggml_tensor *> p_l;
++    // the qcorr corrector's conv history. It needs its own row for a second reason as well: the
++    // corrector sits on EVERY trunk layer, including the full-attention ones that the recurrent
++    // layer filter excludes entirely, so those layers have no r_l / s_l row to hide behind.
++    std::vector<ggml_tensor *> c_l;
+ 
+ private:
+     //const llama_model & model;
+@@ -128,6 +132,7 @@ private:
+     size_t size_r_bytes() const;
+     size_t size_s_bytes() const;
+     size_t size_p_bytes() const;
++    size_t size_c_bytes() const;
+ 
+     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
+     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+@@ -174,6 +179,7 @@ public:
+     ggml_tensor * get_r_l(int32_t il) const;
+     ggml_tensor * get_s_l(int32_t il) const;
+     ggml_tensor * get_p_l(int32_t il) const;
++    ggml_tensor * get_c_l(int32_t il) const;
+ 
+     int32_t s_copy(int i) const;
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 91bb5e7..2aff1c2 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -962,6 +962,12 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
+                 ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
+                 op_tensor = ggml_add(ctx, a, w);
+             } break;
++        case GGML_OP_SUB:
++            {
++                // used by the qcorr corrector's per-channel mean (h - mu)
++                ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], w->ne[1], w->ne[2], w->ne[3]);
++                op_tensor = ggml_sub(ctx, a, w);
++            } break;
+         case GGML_OP_ADD_ID:
+             {
+                 const int n_expert_used = hparams.n_expert_used_max();
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index b837e27..a87fd80 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1277,6 +1277,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+     std::fill(hparams.n_head_kv_arr.begin(),    hparams.n_head_kv_arr.end(),    0);
+     std::fill(hparams.n_ff_arr.begin(),         hparams.n_ff_arr.end(),         0);
+     std::fill(hparams.n_ff_exp_arr.begin(),     hparams.n_ff_exp_arr.end(),     0);
++    // no corrector unless the arch loader finds the corr.* keys
++    std::fill(hparams.corr_hidden_arr.begin(),  hparams.corr_hidden_arr.end(),  0);
+ 
+     std::fill(hparams.rope_sections.begin(), hparams.rope_sections.end(), 0);
+     std::fill(hparams.rope_pattern.begin(),  hparams.rope_pattern.end(), 1);
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 4c4a30e..ef78a6a 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -217,6 +217,25 @@ struct llama_layer_shortconv {
+     struct ggml_tensor * out_proj = nullptr;
+ };
+ 
++// qcorr residual corrector, one per trunk layer. Applied to the finished layer output h:
++//   x   = (h - mu) / sd
++//   xm  = x + depthwise_causal_conv1d(x, conv)          (K taps, per channel, no bias)
++//   y   = gelu_erf(xm @ up^T + up_b) @ down^T + down_b
++//   out = h + sigmoid(x @ gate^T + gate_b) * y          (the gate reads x, not xm)
++// ne comments below are the ggml ne order (ne[0] fastest), which is the reverse of the
++// PyTorch/NumPy shape the Opti packer writes for these tensors.
++struct llama_layer_corrector {
++    struct ggml_tensor * norm_mu = nullptr;  // per-channel mean                ne [n_embd]
++    struct ggml_tensor * norm_sd = nullptr;  // per-channel standard deviation  ne [n_embd]
++    struct ggml_tensor * conv    = nullptr;  // depthwise causal conv           ne [K, n_embd]
++    struct ggml_tensor * up      = nullptr;  //                                 ne [n_embd, H]
++    struct ggml_tensor * up_b    = nullptr;  //                                 ne [H]
++    struct ggml_tensor * down    = nullptr;  //                                 ne [H, n_embd]
++    struct ggml_tensor * down_b  = nullptr;  //                                 ne [n_embd]
++    struct ggml_tensor * gate    = nullptr;  //                                 ne [n_embd, 1]
++    struct ggml_tensor * gate_b  = nullptr;  //                                 ne [1]
++};
++
+ struct llama_layer_nextn {
+     struct ggml_tensor * eh_proj               = nullptr;
+     struct ggml_tensor * eh_proj_s             = nullptr;
+@@ -588,6 +607,8 @@ struct llama_layer {
+ 
+     struct llama_layer_shortconv shortconv;
+ 
++    struct llama_layer_corrector corr;
++
+     struct llama_layer_nextn nextn;
+ 
+     struct llama_layer_switch_lora switch_lora;
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 34ff25d..03d9ab1 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -324,6 +324,14 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
+     quantize &= name.find("ssm_conv1d") == std::string::npos;
+     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
+ 
++    // the qcorr corrector's depthwise conv MUST stay F32 -- every backend asserts it
++    // (ggml-metal-device.cpp, ssm-conv.cu, ggml-cpu/ops.cpp) -- and it is only [K, n_embd].
++    // corr_gate.weight is [n_embd, 1], which ggml_n_dims already reports as 1-D so the
++    // "< 2 dims" bail above catches it; the explicit skip keeps that true if the packer ever
++    // stores it differently. corr_up / corr_down are the two that SHOULD quantize.
++    quantize &= name.find("corr_conv.weight") == std::string::npos;
++    quantize &= name.find("corr_gate.weight") == std::string::npos;
++
+     // do not quantize MiniMax's indexer projection weights, they are tiny
+     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
+     quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
+diff --git a/src/models/models.h b/src/models/models.h
+index 93a6b34..3fee7f3 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2327,6 +2327,24 @@ struct llama_model_qwen35 : public llama_model_base {
+                     ggml_tensor * input,
+                             int   il);
+ 
++        // qcorr residual corrector: h -> h + gate * MLP(conv(norm(h))). Returns `h` unchanged
++        // for a layer without one, so the call site needs no guard.
++        ggml_tensor * build_corrector(
++             llm_graph_input_rs * inp,
++                    ggml_tensor * h,
++                            int   il);
++
++        // read the corrector's conv history out of its own recurrent row, left-concat it to x
++        // and write the new tail back. The shared build_conv_state cannot do this: it hard-codes
++        // hparams.n_embd_r() as the row width, and this row is corr_conv_state() wide.
++        ggml_tensor * build_corr_conv_state(
++             llm_graph_input_rs * inp,
++                    ggml_tensor * conv_states_all,
++                    ggml_tensor * x,
++                        int64_t   state_cols,
++                        int64_t   channels,
++                            int   il);
++
+         const llama_model & model;
+     };
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 0b92109..cca3571 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -22,6 +22,25 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+         }
+     }
+ 
++    // qcorr residual corrector, optional. Absent keys leave corr_conv_k == 0 and
++    // corr_hidden_arr all-zero (filled by llama_model::load_hparams), which makes
++    // hparams.has_corr(il) false for every layer and the whole feature inert.
++    // The array must have exactly n_layer() entries, one per trunk layer; a 0 entry means
++    // that layer carries no corrector. The Opti packer writes both keys.
++    if (ml.get_key_or_arr(LLM_KV_CORRECTOR_HIDDEN_SIZE, hparams.corr_hidden_arr, hparams.n_layer(), false)) {
++        ml.get_key(LLM_KV_CORRECTOR_CONV_KERNEL, hparams.corr_conv_k, true);
++        if (hparams.corr_conv_k <= 1) {
++            throw std::runtime_error(format("corr.conv_kernel must be > 1, got %u", hparams.corr_conv_k));
++        }
++
++        uint32_t corr_n_embd = hparams.n_embd;
++        ml.get_key(LLM_KV_CORRECTOR_EMBEDDING_LENGTH, corr_n_embd, false);
++        if (corr_n_embd != hparams.n_embd) {
++            throw std::runtime_error(format("corr.embedding_length %u != model n_embd %u -- corrector packed against a different base",
++                        corr_n_embd, hparams.n_embd));
++        }
++    }
++
+     switch (hparams.n_layer()) {
+         case 24: type = hparams.n_embd == 1024 ? LLM_TYPE_0_8B : LLM_TYPE_2B; break;
+         case 32: type = hparams.n_embd == 2560 ? LLM_TYPE_4B : LLM_TYPE_9B; break;
+@@ -88,6 +107,51 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
+         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
+         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
++
++        // qcorr residual corrector (optional). The n_corr > 0 guard means no create_tensor call
++        // is made at all for a GGUF without the corr.* keys, so n_created stays exact there.
++        const int64_t n_corr = (int64_t) hparams.corr_hidden(il);
++        if (n_corr > 0) {
++            const int64_t corr_k = (int64_t) hparams.corr_conv_k;
++
++            layer.corr.norm_mu = create_tensor(tn(LLM_TENSOR_CORR_NORM_MU, il),           { n_embd },         TENSOR_NOT_REQUIRED);
++            layer.corr.norm_sd = create_tensor(tn(LLM_TENSOR_CORR_NORM_SD, il),           { n_embd },         TENSOR_NOT_REQUIRED);
++            // the packer keeps the torch conv1d middle dim, ne [K, 1, n_embd]; ALLOW_RESHAPE
++            // folds it to the 2-D [K, n_embd] matrix ggml_ssm_conv requires (bytes unchanged)
++            layer.corr.conv    = create_tensor(tn(LLM_TENSOR_CORR_CONV, "weight", il),    { corr_k, n_embd }, TENSOR_NOT_REQUIRED | TENSOR_ALLOW_RESHAPE);
++            layer.corr.up      = create_tensor(tn(LLM_TENSOR_CORR_UP,   "weight", il),    { n_embd, n_corr }, TENSOR_NOT_REQUIRED);
++            layer.corr.up_b    = create_tensor(tn(LLM_TENSOR_CORR_UP,   "bias",   il),    { n_corr },         TENSOR_NOT_REQUIRED);
++            layer.corr.down    = create_tensor(tn(LLM_TENSOR_CORR_DOWN, "weight", il),    { n_corr, n_embd }, TENSOR_NOT_REQUIRED);
++            layer.corr.down_b  = create_tensor(tn(LLM_TENSOR_CORR_DOWN, "bias",   il),    { n_embd },         TENSOR_NOT_REQUIRED);
++            layer.corr.gate    = create_tensor(tn(LLM_TENSOR_CORR_GATE, "weight", il),    { n_embd, 1 },      TENSOR_NOT_REQUIRED);
++            layer.corr.gate_b  = create_tensor(tn(LLM_TENSOR_CORR_GATE, "bias",   il),    { 1 },              TENSOR_NOT_REQUIRED);
++
++            // all-or-nothing: a half-packed corrector would silently compute garbage
++            const bool any = layer.corr.norm_mu || layer.corr.norm_sd || layer.corr.conv ||
++                             layer.corr.up || layer.corr.up_b || layer.corr.down ||
++                             layer.corr.down_b || layer.corr.gate || layer.corr.gate_b;
++            const bool all = layer.corr.norm_mu && layer.corr.norm_sd && layer.corr.conv &&
++                             layer.corr.up && layer.corr.up_b && layer.corr.down &&
++                             layer.corr.down_b && layer.corr.gate && layer.corr.gate_b;
++            if (any && !all) {
++                throw std::runtime_error(format("layer %d: corr.hidden_size says H=%d but the corrector tensors are incomplete", il, (int) n_corr));
++            }
++            if (!any) {
++                LLAMA_LOG_WARN("%s: layer %d: corr.hidden_size says H=%d but no corrector tensors are present -- the layer will run uncorrected\n",
++                        __func__, il, (int) n_corr);
++            } else {
++                // shape/type dump for the corrector, visible with -v; this is the cheap check
++                // that catches a dimension-order mistake in the packer before any math runs
++                const ggml_tensor * ts[9] = { layer.corr.norm_mu, layer.corr.norm_sd, layer.corr.conv,
++                                              layer.corr.up, layer.corr.up_b, layer.corr.down,
++                                              layer.corr.down_b, layer.corr.gate, layer.corr.gate_b };
++                LLAMA_LOG_DEBUG("%s: layer %3d corrector: H = %4d, K = %2d\n", __func__, il, (int) n_corr, (int) corr_k);
++                for (const ggml_tensor * t : ts) {
++                    LLAMA_LOG_DEBUG("%s:   %-24s %6s %s\n", __func__, ggml_get_name(t),
++                            ggml_type_name(t->type), llama_format_tensor_shape(t).c_str());
++                }
++            }
++        }
+     };
+ 
+     auto load_block_mtp = [&](int il) {
+@@ -195,6 +259,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+         cur = ggml_add(ctx0, cur, ffn_residual);
+         cb(cur, "post_ffn", il);
+ 
++        // qcorr residual corrector on the finished layer output. Both layer types have rejoined
++        // by now, so this is the single hook site. It comes before build_cvec so a control
++        // vector still applies to the final layer output.
++        cur = build_corrector(inp->get_recr(), cur, il);
++
+         cur = build_cvec(cur, il);
+         cb(cur, "l_out", il);
+ 
+@@ -481,6 +550,149 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
+     return cur;
+ }
+ 
++// Read the corrector's conv history out of its own recurrent row and write the new tail back.
++// Ported from llama_model_qwen4exp::graph::build_conv_state_at; the shared build_conv_state
++// hard-codes hparams.n_embd_r() as the row width and cannot address this row.
++//
++//   x        : [channels, T, S]  (channel-major, as the rest of the graph carries it)
++//   returns  : [state_cols + T, channels, S]  (time-major, what ggml_ssm_conv wants)
++ggml_tensor * llama_model_qwen35::graph::build_corr_conv_state(
++        llm_graph_input_rs * inp,
++        ggml_tensor *        conv_states_all,
++        ggml_tensor *        x,
++        int64_t              state_cols,
++        int64_t              channels,
++        int                  il) {
++    const auto * mctx_cur = inp->mctx;
++
++    const auto kv_head = mctx_cur->get_head();
++
++    const int64_t n_seqs    = ubatch.n_seqs;
++    const int64_t row_total = conv_states_all->ne[0];
++
++    // the row is exactly this convolution's state, so the gather is reused as a whole
++    GGML_ASSERT(state_cols * channels == row_total);
++
++    ggml_tensor * rows = build_rs(inp, conv_states_all, row_total, n_seqs);
++
++    ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
++    cb(state, "corr_conv_state", il);
++
++    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
++    cb(conv_input, "corr_conv_input", il);
++
++    // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
++    // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
++    const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
++    const uint32_t mem_size = mctx_cur->get_size();
++
++    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
++
++    for (int64_t slot = 0; slot < n_slots; ++slot) {
++        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
++
++        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
++                state_cols, channels, n_seqs,
++                conv_input->nb[1], conv_input->nb[2],
++                ggml_row_size(conv_input->type, s_idx));
++
++        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
++                state_cols * channels, n_seqs,
++                conv_states_all->nb[1],
++                (slot * mem_size + kv_head) * row_size);
++
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
++    }
++
++    return conv_input;
++}
++
++// The qcorr residual corrector, applied to the finished layer output h [n_embd, n_tokens]:
++//
++//   x   = (h - mu) / sd
++//   xm  = x + depthwise_causal_conv1d(x, cw)          k taps per channel, no bias, no activation
++//   y   = gelu_erf(xm @ w1^T + b1) @ w2^T + b2
++//   out = h + sigmoid(x @ gw^T + gb) * y              NOTE the gate reads x, not xm
++//
++// gelu_erf, not gelu: the trained module uses torch F.gelu with the default approximate='none',
++// and ggml_gelu is the tanh approximation *through an fp16 lookup table* on CPU.
++ggml_tensor * llama_model_qwen35::graph::build_corrector(
++        llm_graph_input_rs * inp,
++        ggml_tensor *        h,
++        int                  il) {
++    const auto & layer = model.layers[il];
++
++    if (!hparams.has_corr(il) || layer.corr.up == nullptr) {
++        return h;
++    }
++
++    // The layer loop gathers `cur` down to n_outputs rows on the LAST layer when
++    // cparams.embeddings_nextn_masked is set (see the inp_out_ids branch above), which breaks
++    // n_tokens == n_seq_tokens * n_seqs and would poison the conv state. The default is off and
++    // llama-perplexity never sets it, so fail loudly rather than compute garbage.
++    GGML_ASSERT(!(cparams.embeddings_nextn_masked && il == (int) hparams.n_layer() - 1) &&
++            "qcorr corrector is incompatible with embeddings_nextn_masked on the last layer");
++
++    const int64_t d            = hparams.n_embd;
++    const int64_t k            = hparams.corr_conv_k;
++    const int64_t n_seqs       = ubatch.n_seqs;
++    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
++
++    GGML_ASSERT(ubatch.equal_seqs());
++    GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
++    GGML_ASSERT(h->ne[0] == d && h->ne[1] == n_seq_tokens * n_seqs);
++
++    ggml_tensor * h3 = ggml_reshape_3d(ctx0, h, d, n_seq_tokens, n_seqs);
++
++    // (1) x = (h - mu) / sd, broadcast over tokens and sequences
++    ggml_tensor * x = ggml_sub(ctx0, h3, layer.corr.norm_mu);
++    x               = ggml_div(ctx0, x, layer.corr.norm_sd);
++    cb(x, "corr_x", il);
++
++    // (2) stateful causal left pad: k-1 history columns ++ this call's positions.
++    // A null row here would mean llama_memory_recurrent's want_corr condition and
++    // hparams.has_corr() have drifted apart; a stateless re-pad would then look plausible
++    // and be silently wrong on every decode step, so refuse instead.
++    ggml_tensor * conv_states_all = inp->mctx->get_c_l(il);
++    GGML_ASSERT(conv_states_all != nullptr && "no corrector conv-state row for a corrected layer");
++
++    ggml_tensor * conv_in = build_corr_conv_state(inp, conv_states_all, x, k - 1, d, il);
++
++    // (3) depthwise causal conv (cross-correlation, bias-free) and (4) its residual
++    ggml_tensor * xc = ggml_ssm_conv(ctx0, conv_in, layer.corr.conv);
++    cb(xc, "corr_conv_out", il);
++
++    ggml_tensor * xm = ggml_add(ctx0, x, xc);
++    cb(xm, "corr_xm", il);
++
++    // (5) the bottleneck MLP. Built by hand rather than with build_ffn, which hard-codes ggml_gelu.
++    ggml_tensor * xm2 = ggml_reshape_2d(ctx0, xm, d, n_seq_tokens * n_seqs);
++    ggml_tensor * u   = ggml_mul_mat(ctx0, layer.corr.up, xm2);
++    u                 = ggml_add(ctx0, u, layer.corr.up_b);
++    u                 = ggml_gelu_erf(ctx0, u);
++    cb(u, "corr_u", il);
++
++    ggml_tensor * y = ggml_mul_mat(ctx0, layer.corr.down, u);
++    y               = ggml_add(ctx0, y, layer.corr.down_b);
++    cb(y, "corr_y", il);
++
++    // (6) the gate, from x (NOT xm)
++    ggml_tensor * x2 = ggml_reshape_2d(ctx0, x, d, n_seq_tokens * n_seqs);
++    ggml_tensor * g  = ggml_mul_mat(ctx0, layer.corr.gate, x2);
++    g                = ggml_add(ctx0, g, layer.corr.gate_b);
++    g                = ggml_sigmoid(ctx0, g);
++    cb(g, "corr_gate", il);
++
++    // (7) out = h + g * y; g is [1, n_tokens] and broadcasts across ne[0]
++    ggml_tensor * out = ggml_add(ctx0, h, ggml_mul(ctx0, y, g));
++    // note: without a control vector, build_cvec is the identity and immediately renames this
++    // same tensor to "l_out", so "corr_out" only appears in an eval-callback trace when a
++    // control vector is loaded. l_out is the corrector output either way.
++    cb(out, "corr_out", il);
++
++    return out;
++}
++
+ // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 dense series
+ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+     : llm_graph_context(params) {

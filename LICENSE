@@ -1,0 +1,39 @@
+OPTI RUNTIME LICENSE, version 1.0 (September 2026)
+
+This license covers the files in this repository ("the Runtime"): a patch to llama.cpp, build scripts and documentation
+that let llama.cpp load and execute Opti model files. Opti is a compression method that is the subject of U.S. Provisional
+Patent Application No. 64/154,967, filed September 15, 2026 ("the Method"). PATENT PENDING.
+
+1. Permitted use. You may download, build, run, study and modify the Runtime, and share your unmodified or modified
+   copies of it under this same license, for evaluation, benchmarking, personal use, and non-commercial research.
+   You may publish results obtained with it, with attribution to "Opti" and a link to this repository.
+
+2. Restrictions. Except with the licensor's prior written permission, you may not:
+   a. use the Runtime, or a service built on it, for commercial purposes, or distribute it as part of a commercial
+      product or service;
+   b. use the Runtime, or knowledge gained from it, to train, construct, or distribute a substitute for the Method,
+      or to produce model files that use the Method's file format other than those obtained from the licensor;
+   c. remove or alter this license, the patent notice, the llama.cpp license and notices, or the attribution notices.
+
+3. What is not licensed. This license covers the Runtime only. It grants no right to the Method, to the training
+   procedure that produces Opti model files, or to any Opti model file, which are licensed separately.
+
+4. Patents. No patent license is granted under this license, express or implied, except the limited right to run the
+   Runtime for the uses permitted in section 1. Any use of the Runtime to challenge the licensor's patent rights
+   terminates this license.
+
+5. llama.cpp. The Runtime is a modification of llama.cpp, which is licensed under the MIT License, copyright the ggml
+   authors. That license and its notices apply to the unmodified llama.cpp code and remain in the source tree. Nothing
+   in this license restricts any right you hold under the MIT License to llama.cpp itself.
+
+6. Commercial licenses. Commercial use and distribution are available under separate agreement. Contact the licensor
+   through the Hugging Face profile that hosts the Opti models.
+
+7. No warranty. THE RUNTIME IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES
+   OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL THE LICENSOR BE LIABLE
+   FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE RUNTIME OR ITS USE.
+
+8. Termination. This license ends automatically if you breach it. On termination you must stop using the Runtime and
+   delete your copies. Sections 3, 4, 5, 7 and 8 survive termination.
+
+Copyright (c) 2026 the licensor. All rights not expressly granted are reserved.
