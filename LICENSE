@@ -11,16 +11,16 @@ Patent Application No. 64/154,967, filed September 15, 2026 ("the Method"). PATE
 2. Restrictions. Except with the licensor's prior written permission, you may not:
    a. use the Runtime, or a service built on it, for commercial purposes, or distribute it as part of a commercial
       product or service;
-   b. use the Runtime, or knowledge gained from it, to train, construct, or distribute a substitute for the Method,
-      or to produce model files that use the Method's file format other than those obtained from the licensor;
+   b. use the Runtime to produce or distribute model files in the Method's file format other than those obtained from
+      the licensor, or as part of a substitute for the Method;
    c. remove or alter this license, the patent notice, the llama.cpp license and notices, or the attribution notices.
 
 3. What is not licensed. This license covers the Runtime only. It grants no right to the Method, to the training
    procedure that produces Opti model files, or to any Opti model file, which are licensed separately.
 
 4. Patents. No patent license is granted under this license, express or implied, except the limited right to run the
-   Runtime for the uses permitted in section 1. Any use of the Runtime to challenge the licensor's patent rights
-   terminates this license.
+   Runtime for the uses permitted in section 1. If you initiate patent litigation against the licensor alleging that
+   the Runtime or the Method infringes a patent you control, this license terminates.
 
 5. llama.cpp. The Runtime is a modification of llama.cpp, which is licensed under the MIT License, copyright the ggml
    authors. That license and its notices apply to the unmodified llama.cpp code and remain in the source tree. Nothing
