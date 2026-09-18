@@ -36,7 +36,8 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j --target llama-server llama-cli llama-perplexity
 ```
 
-CPU only: the same as Apple Silicon on any machine. `build.sh` in this repository runs the steps above.
+AMD (ROCm / HIP): `cmake -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_BUILD_TYPE=Release` (set your GPU target), then
+the same build line. CPU only: the same as Apple Silicon on any machine. `build.sh` in this repository runs the steps above.
 
 ## Run
 
@@ -62,7 +63,9 @@ quantizations of the same model, measured the same way on the same machine.
 ## Compatibility
 
 - Files: any GGUF. Opti files are detected by their `corr.*` metadata keys; a file without them runs exactly as on stock llama.cpp.
-- Verified on RTX 3090 (sm_86), RTX 4090 and L40S (sm_89), H100 (sm_90), and Apple Silicon (Metal).
+- Verified on RTX 3090 (sm_86), RTX 4090 and L40S (sm_89), H100 (sm_90), and Apple Silicon (Metal). An independent tester
+  built it with `-DGGML_HIP=ON -DGPU_TARGETS=gfx1151` and ran the 27B file on an AMD Strix Halo APU (Radeon 8060S, ROCm):
+  loads, answers correctly, about 11 tokens/s on that APU.
 - The patch touches the model loader, the recurrent-state memory, the Qwen3.5-family graph, and one CUDA kernel's kernel-width
   limit. It adds no new dependencies.
 
